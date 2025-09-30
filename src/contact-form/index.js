@@ -49,8 +49,8 @@ const validateInput = (data) => {
     errors.push('Subject must be at least 3 characters');
   }
 
-  if (!data.message || data.message.trim().length < 10) {
-    errors.push('Message must be at least 10 characters');
+  if (!data.message || data.message.trim().length === 0) {
+    errors.push('Message is required');
   }
 
   return errors;
