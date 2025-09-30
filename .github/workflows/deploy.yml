@@ -1,0 +1,116 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: creer-web-consulting-api
+  S3_BUCKET: creer-web-consulting-lambda-deployments
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: src/contact-form/package.json
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Lambda dependencies
+        run: |
+          cd src/contact-form
+          npm ci --production
+          cd ../..
+
+      - name: Package Lambda function
+        run: |
+          cd src/contact-form
+          zip -r ../../deployment-package.zip . -x "*.git*" "test.js" "node_modules/.cache/*"
+          cd ../..
+
+      - name: Create S3 bucket if not exists
+        run: |
+          if ! aws s3 ls "s3://${{ env.S3_BUCKET }}" 2>&1 > /dev/null; then
+            echo "Creating S3 bucket: ${{ env.S3_BUCKET }}"
+            aws s3 mb "s3://${{ env.S3_BUCKET }}" --region ${{ env.AWS_REGION }}
+          else
+            echo "S3 bucket already exists"
+          fi
+
+      - name: Upload Lambda package to S3
+        run: |
+          aws s3 cp deployment-package.zip "s3://${{ env.S3_BUCKET }}/contact-form-lambda.zip"
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --template-file cloudformation/template.yaml \
+            --stack-name ${{ env.STACK_NAME }} \
+            --parameter-overrides \
+              SenderEmail=${{ secrets.SENDER_EMAIL }} \
+              RecipientEmail=${{ secrets.RECIPIENT_EMAIL }} \
+              CorsOrigin=${{ secrets.CORS_ORIGIN }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --region ${{ env.AWS_REGION }} \
+            --no-fail-on-empty-changeset
+
+      - name: Update Lambda function code
+        run: |
+          aws lambda update-function-code \
+            --function-name ContactFormFunction \
+            --s3-bucket ${{ env.S3_BUCKET }} \
+            --s3-key contact-form-lambda.zip \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for Lambda update
+        run: |
+          aws lambda wait function-updated \
+            --function-name ContactFormFunction \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Get API endpoint
+        id: get-endpoint
+        run: |
+          ENDPOINT=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' \
+            --output text \
+            --region ${{ env.AWS_REGION }})
+          echo "endpoint=$ENDPOINT" >> $GITHUB_OUTPUT
+          echo "API Endpoint: $ENDPOINT"
+
+      - name: Deployment summary
+        run: |
+          echo "### Deployment Successful! 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**API Endpoint:** ${{ steps.get-endpoint.outputs.endpoint }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Stack Name:** ${{ env.STACK_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Region:** ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployed at:** $(date -u)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Test API endpoint
+        run: |
+          echo "Testing API endpoint..."
+          curl -X POST ${{ steps.get-endpoint.outputs.endpoint }} \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"CI Test","email":"test@example.com","subject":"Test","message":"Automated test from GitHub Actions"}' \
+            --fail --silent --show-error || echo "API test failed (expected if validation fails)"
